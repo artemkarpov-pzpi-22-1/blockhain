@@ -1,18 +1,26 @@
 import { ethers } from "hardhat";
 
-// Розгортання контракту CertificateRegistry на обраній мережі (--network)
+/**
+ * Деплой контракту CertificateRegistry.
+ * Перший параметр конструктора — initialOwner (адреса власника OpenZeppelin Ownable).
+ * Запуск: npx hardhat run scripts/deploy.ts --network localhost
+ * (потрібен окремо запущений `npx hardhat node`, якщо мережа localhost).
+ */
 async function main(): Promise<void> {
   const [deployer] = await ethers.getSigners();
-  const factory = await ethers.getContractFactory("CertificateRegistry");
-  const registry = await factory.deploy();
-  await registry.waitForDeployment();
-  const address = await registry.getAddress();
 
-  console.log("CertificateRegistry deployed to:", address);
-  console.log("Deployer:", deployer.address);
+  const CertificateRegistry = await ethers.getContractFactory("CertificateRegistry");
+  const registry = await CertificateRegistry.deploy(deployer.address);
+
+  await registry.waitForDeployment();
+
+  const contractAddress = await registry.getAddress();
+
+  console.log("CertificateRegistry deployed to:", contractAddress);
+  console.log("Owner (initialOwner):", deployer.address);
 }
 
-main().catch((e: unknown) => {
-  console.error(e);
+main().catch((error: unknown) => {
+  console.error(error);
   process.exitCode = 1;
 });

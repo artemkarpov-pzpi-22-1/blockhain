@@ -1,102 +1,153 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
+import type { CertificateRegistry } from "../typechain-types";
 
+/**
+ * Тести реєстру CertificateRegistry (Hardhat + ethers v6).
+ * Перевіряються ролі owner / authorized issuer, реєстрація, відкликання та verifyCertificateHash.
+ */
 describe("CertificateRegistry", function () {
   const certificateId = "LAB-2026-001";
   const ownerName = "Іван Петренко";
   const courseName = "Децентралізовані системи";
-  const issueDate = 1711731600;
-  const issuer = "Університет";
+  const issueDate = "2026-03-28";
 
-  async function docHash(value: string = "commitment"): Promise<string> {
-    return ethers.keccak256(ethers.toUtf8Bytes(value));
+  /** Хеш «документа» поза ланцюгом (навчальний commitment). */
+  async function documentHash(bytes: string = "commitment"): Promise<string> {
+    return ethers.keccak256(ethers.toUtf8Bytes(bytes));
   }
 
-  it("реєструє сертифікат зі статусом Active", async function () {
-    const [alice] = await ethers.getSigners();
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const hash = await docHash();
+  async function deployRegistry(ownerAddress: string): Promise<CertificateRegistry> {
+    const Factory = await ethers.getContractFactory("CertificateRegistry");
+    return Factory.deploy(ownerAddress);
+  }
 
-    await expect(registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash, issuer))
-      .to.emit(registry, "CertificateRegistered")
-      .withArgs(certificateId, hash, alice.address);
+  describe("реєстрація та доступ", function () {
+    it("власник контракту може зареєструвати сертифікат без authorizeIssuer", async function () {
+      const [owner] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
 
-    const v = await registry.verifyById(certificateId);
-    expect(v).to.equal(true);
+      await expect(registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash))
+        .to.emit(registry, "CertificateRegistered")
+        .withArgs(certificateId, owner.address, hash);
 
-    const cert = await registry.getCertificate(certificateId);
-    expect(cert.ownerName).to.equal(ownerName);
-    expect(cert.courseName).to.equal(courseName);
-    expect(cert.issueDate).to.equal(issueDate);
-    expect(cert.documentHash).to.equal(hash);
-    expect(cert.issuer).to.equal(issuer);
-    expect(cert.status).to.equal(0n);
-    expect(cert.registeredBy).to.equal(alice.address);
+      expect(await registry.verifyCertificateHash(certificateId, hash)).to.equal(true);
+
+      const cert = await registry.getCertificate(certificateId);
+      expect(cert.certificateId).to.equal(certificateId);
+      expect(cert.ownerName).to.equal(ownerName);
+      expect(cert.courseName).to.equal(courseName);
+      expect(cert.issueDate).to.equal(issueDate);
+      expect(cert.documentHash).to.equal(hash);
+      expect(cert.issuer).to.equal(owner.address);
+      expect(cert.exists).to.equal(true);
+      expect(cert.revoked).to.equal(false);
+    });
+
+    it("authorized issuer реєструє; сторонній акаунт — ні", async function () {
+      const [owner, issuer, stranger] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
+
+      await expect(registry.connect(owner).authorizeIssuer(issuer.address))
+        .to.emit(registry, "IssuerAuthorized")
+        .withArgs(issuer.address);
+
+      await expect(
+        registry.connect(issuer).registerCertificate(certificateId, ownerName, courseName, issueDate, hash)
+      ).to.emit(registry, "CertificateRegistered");
+
+      await expect(
+        registry.connect(stranger).registerCertificate("OTHER-1", ownerName, courseName, issueDate, hash)
+      ).to.be.revertedWithCustomError(registry, "NotOwnerOrAuthorizedIssuer");
+    });
+
+    it("не дозволяє повторну реєстрацію того ж certificateId", async function () {
+      const [owner] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
+
+      await registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash);
+      await expect(
+        registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash)
+      ).to.be.revertedWithCustomError(registry, "CertificateAlreadyExists");
+    });
+
+    it("відхиляє реєстрацію з порожнім certificateId", async function () {
+      const [owner] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
+
+      await expect(
+        registry.registerCertificate("", ownerName, courseName, issueDate, hash)
+      ).to.be.revertedWithCustomError(registry, "EmptyCertificateId");
+    });
   });
 
-  it("не дозволяє подвійну реєстрацію того ж certificateId", async function () {
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const hash = await docHash();
+  describe("верифікація хеша", function () {
+    it("verifyCertificateHash повертає false, якщо хеш не збігається", async function () {
+      const [owner] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const stored = await documentHash("doc-a");
+      const other = await documentHash("doc-b");
 
-    await registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash, issuer);
-    await expect(
-      registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash, issuer)
-    ).to.be.revertedWithCustomError(registry, "CertificateAlreadyExists");
+      await registry.registerCertificate(certificateId, ownerName, courseName, issueDate, stored);
+
+      expect(await registry.verifyCertificateHash(certificateId, stored)).to.equal(true);
+      expect(await registry.verifyCertificateHash(certificateId, other)).to.equal(false);
+    });
   });
 
-  it("відкликає сертифікат і verifyById повертає false", async function () {
-    const [alice] = await ethers.getSigners();
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const hash = await docHash();
+  describe("відкликання сертифіката", function () {
+    it("після revokeCertificate verifyCertificateHash стає false", async function () {
+      const [owner, issuer] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
 
-    await registry.registerCertificate(certificateId, ownerName, courseName, issueDate, hash, issuer);
+      await registry.connect(owner).authorizeIssuer(issuer.address);
+      await registry.connect(issuer).registerCertificate(certificateId, ownerName, courseName, issueDate, hash);
 
-    await expect(registry.revokeCertificate(certificateId))
-      .to.emit(registry, "CertificateRevoked")
-      .withArgs(certificateId, alice.address);
+      expect(await registry.verifyCertificateHash(certificateId, hash)).to.equal(true);
 
-    expect(await registry.verifyById(certificateId)).to.equal(false);
+      await expect(registry.connect(issuer).revokeCertificate(certificateId))
+        .to.emit(registry, "CertificateRevoked")
+        .withArgs(certificateId, issuer.address);
 
-    const cert = await registry.getCertificate(certificateId);
-    expect(cert.status).to.equal(1n);
+      expect(await registry.verifyCertificateHash(certificateId, hash)).to.equal(false);
+      const cert = await registry.getCertificate(certificateId);
+      expect(cert.revoked).to.equal(true);
+    });
+
+    it("сторонній не може відкликати сертифікат", async function () {
+      const [owner, issuer, stranger] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
+
+      await registry.connect(owner).authorizeIssuer(issuer.address);
+      await registry.connect(issuer).registerCertificate(certificateId, ownerName, courseName, issueDate, hash);
+
+      await expect(registry.connect(stranger).revokeCertificate(certificateId)).to.be.revertedWithCustomError(
+        registry,
+        "NotOwnerOrAuthorizedIssuer"
+      );
+    });
   });
 
-  it("verifyByIdAndHash: істина лише за збігу hash і статусу Active", async function () {
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const h1 = await docHash("doc-a");
-    const h2 = await docHash("doc-b");
+  describe("керування емітентами", function () {
+    it("revokeIssuerAuthorization забирає право реєстрації", async function () {
+      const [owner, issuer] = await ethers.getSigners();
+      const registry = await deployRegistry(owner.address);
+      const hash = await documentHash();
 
-    await registry.registerCertificate(certificateId, ownerName, courseName, issueDate, h1, issuer);
+      await registry.connect(owner).authorizeIssuer(issuer.address);
+      await expect(registry.connect(owner).revokeIssuerAuthorization(issuer.address))
+        .to.emit(registry, "IssuerRevoked")
+        .withArgs(issuer.address);
 
-    expect(await registry.verifyByIdAndHash(certificateId, h1)).to.equal(true);
-    expect(await registry.verifyByIdAndHash(certificateId, h2)).to.equal(false);
-  });
-
-  it("відхиляє відкликання сертифіката чужим обліковим записом", async function () {
-    const [alice, bob] = await ethers.getSigners();
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const hash = await docHash();
-
-    await registry.connect(alice).registerCertificate(certificateId, ownerName, courseName, issueDate, hash, issuer);
-
-    await expect(registry.connect(bob).revokeCertificate(certificateId)).to.be.revertedWithCustomError(
-      registry,
-      "UnauthorizedRevoke"
-    );
-  });
-
-  it("відхиляє реєстрацію з порожнім certificateId", async function () {
-    const Registry = await ethers.getContractFactory("CertificateRegistry");
-    const registry = await Registry.deploy();
-    const hash = await docHash();
-
-    await expect(
-      registry.registerCertificate("", ownerName, courseName, issueDate, hash, issuer)
-    ).to.be.revertedWithCustomError(registry, "EmptyCertificateId");
+      await expect(
+        registry.connect(issuer).registerCertificate(certificateId, ownerName, courseName, issueDate, hash)
+      ).to.be.revertedWithCustomError(registry, "NotOwnerOrAuthorizedIssuer");
+    });
   });
 });
